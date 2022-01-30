@@ -16,7 +16,12 @@
 
 package com.databricks.spark.sql.perf.tpcds
 
+import com.databricks.spark.sql.perf.utils.Utils
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
+
+import scala.collection.mutable.ArrayBuffer
 
 case class GenTPCDSDataConfig(
     master: String = "local[*]",
@@ -31,7 +36,9 @@ case class GenTPCDSDataConfig(
     clusterByPartitionColumns: Boolean = true,
     filterOutNullPartitionValues: Boolean = true,
     tableFilter: String = "",
-    numPartitions: Int = 100)
+    numPartitions: Int = 100,
+    action: String = "genData",
+    dbName: String = "")
 
 /**
  * Gen TPCDS data.
@@ -83,6 +90,12 @@ object GenTPCDSData {
       opt[Int]('n', "numPartitions")
         .action((x, c) => c.copy(numPartitions = x))
         .text("how many dsdgen partitions to run - number of input tasks.")
+      opt[String]('a', "action of genData or genTable")
+        .action((x, c) => c.copy(action = x))
+        .text("action of genData or genTable.")
+      opt[String]('b', "db name")
+        .action((x, c) => c.copy(dbName = x))
+        .text("db name")
       help("help")
         .text("prints this usage text")
     }
@@ -108,14 +121,47 @@ object GenTPCDSData {
       useDoubleForDecimal = config.useDoubleForDecimal,
       useStringForDate = config.useStringForDate)
 
-    tables.genData(
-      location = config.location,
-      format = config.format,
-      overwrite = config.overwrite,
-      partitionTables = config.partitionTables,
-      clusterByPartitionColumns = config.clusterByPartitionColumns,
-      filterOutNullPartitionValues = config.filterOutNullPartitionValues,
-      tableFilter = config.tableFilter,
-      numPartitions = config.numPartitions)
+    config.action match {
+      case "genData" =>
+
+        tables.genRawData(
+          location = config.location,
+          format = config.format,
+          overwrite = config.overwrite,
+          partitionTables = config.partitionTables,
+          clusterByPartitionColumns = config.clusterByPartitionColumns,
+          filterOutNullPartitionValues = config.filterOutNullPartitionValues,
+          tableFilter = config.tableFilter,
+          numPartitions = config.numPartitions)
+      case "genTable" =>
+        skipTableDataNotExist(tables, config.location)
+        tables.createExternalTables(
+          location = config.location,
+          format = config.format,
+          databaseName = config.dbName,
+          overwrite = false,
+          discoverPartitions = true)
+        tables.analyzeTables(databaseName = config.dbName, true)
+      case _ => print("config of action do not match any of 'genData' or 'genTable'")
+    }
+  }
+
+  def skipTableDataNotExist(tables: TPCDSTables, dbLocation: String) = {
+    val tablesList = tables.tables
+    tables.tables = tablesList.filter(tab => {
+      val location = dbLocation.stripSuffix("/") + "/" + tab.name
+      val path = new Path(location)
+      val fs = path.getFileSystem(Utils.configuration)
+
+      if (!(fs.exists(path) &&
+        fs.listFiles(path, true).hasNext)) {
+        // skip create table
+        println(s"skip create table of ${tab.name}, because of wrong fs data," +
+          s" which may be empty! ")
+        false
+      } else {
+        true
+      }
+    })
   }
 }

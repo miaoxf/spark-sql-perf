@@ -16,18 +16,54 @@
 
 package com.databricks.spark.sql.perf.tpcds
 
-import scala.sys.process._
-
-import com.databricks.spark.sql.perf
-import com.databricks.spark.sql.perf.{BlockingLineStream, DataGenerator, Table, Tables}
-
+import com.databricks.spark.sql.perf.utils.Utils
+import com.databricks.spark.sql.perf.{BlockingLineStream, DataGenerator, Tables}
+import org.apache.hadoop.fs.Path
 import org.apache.spark.SparkContext
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SQLContext
+import org.apache.spark.util.SerializableConfiguration
+
+import java.io.{BufferedReader, InputStreamReader}
+import java.util
+import java.util.stream.Collectors
+import scala.collection.convert.ImplicitConversions.`list asScalaBuffer`
+
 
 class DSDGEN(dsdgenDir: String) extends DataGenerator {
   val dsdgen = s"$dsdgenDir/dsdgen"
+  val temp_dat_dir = "_temp_dat"
+  var generatedFiles: RDD[String] = null
 
   def generate(sparkContext: SparkContext, name: String, partitions: Int, scaleFactor: String) = {
+    val generatedData = {
+      assert(generatedFiles != null, "generatedFiles不能为空，需要先生成hdfs文件!")
+      val currentTableName = sparkContext.broadcast(name)
+      val configuration = sparkContext.broadcast(new SerializableConfiguration(Utils.configuration))
+      generatedFiles.map(new Path(_)).filter(f => {
+        val tableName = currentTableName.value
+        val realName = f.getName
+        val regex = s"^${tableName}[_0-9]*\\.dat" + "$"
+        println(s"regex of matching file is $regex")
+        realName.contains(tableName) && (regex.r findFirstIn realName).isDefined
+      }).repartition(partitions).flatMap { p =>
+        println(s"reading file:${p.getName}")
+        val fs = p.getFileSystem(configuration.value.value)
+        val reader = new BufferedReader(new InputStreamReader(fs.open(p)))
+        val value: util.List[String] = reader.lines().collect(Collectors.toList[String])
+        value.toSeq
+      }
+    }
+
+    generatedData.setName(s"$name, sf=$scaleFactor, strings")
+    generatedData
+  }
+
+  override def generateAll(
+                   sparkContext: SparkContext,
+                   location: String,
+                   partitions: Int,
+                   scaleFactor: String): RDD[String] = {
     val generatedData = {
       sparkContext.parallelize(1 to partitions, partitions).flatMap { i =>
         val localToolsDir = if (new java.io.File(dsdgen).exists) {
@@ -35,21 +71,48 @@ class DSDGEN(dsdgenDir: String) extends DataGenerator {
         } else if (new java.io.File(s"/$dsdgen").exists) {
           s"/$dsdgenDir"
         } else {
-          sys.error(s"Could not find dsdgen at $dsdgen or /$dsdgen. Run install")
+          // todo
+          var installPath = ""
+          try {
+            installPath = Utils.installTpcds()
+          } catch {
+            case exception: Exception =>
+              println(s"Could not find dsdgen at $dsdgen or /$dsdgen. Run install")
+          }
+          assert(!installPath.isEmpty)
+          installPath
         }
 
         // Note: RNGSEED is the RNG seed used by the data generator. Right now, it is fixed to 100.
         val parallel = if (partitions > 1) s"-parallel $partitions -child $i" else ""
-        val commands = Seq(
-          "bash", "-c",
-          s"cd $localToolsDir && ./dsdgen -table $name -filter Y -scale $scaleFactor -RNGSEED 100 $parallel")
-        println(commands)
-        BlockingLineStream(commands)
+        val localDataPath = s"/tmp/tpcds/data/$i"
+        val localDataDir = new java.io.File(localDataPath)
+        localDataDir.deleteOnExit()
+        localDataDir.mkdirs()
+
+        try {
+          val commands = Seq(
+            "bash", "-c",
+            s"cd $localToolsDir && ./dsdgen -scale $scaleFactor" +
+              s" -RNGSEED 100 $parallel -FORCE Y " +
+              s"-SUFFIX .dat -DIR $localDataPath")
+          println(commands)
+          BlockingLineStream(commands)
+        } catch {
+          case exception: Exception => println(s"generate all data failed!" +
+            s" try to read data from existed files!")
+        }
+        val hdfsPath = location.stripSuffix("/") + s"/${temp_dat_dir}"
+        Utils.copyFromLocalDir(localDataPath, hdfsPath)
+        Utils.listLocalFiles(localDataPath).map(hdfsPath + "/" + _)
       }
     }
 
-    generatedData.setName(s"$name, sf=$scaleFactor, strings")
-    generatedData
+    generatedData.setName(s"生成原始文件到hdfs")
+    generatedFiles = generatedData
+    generatedFiles.cache()
+    generatedFiles.count()
+    generatedFiles
   }
 }
 
@@ -64,7 +127,7 @@ class TPCDSTables(
   import sqlContext.implicits._
 
   val dataGenerator = new DSDGEN(dsdgenDir)
-  val tables = Seq(
+  var tables = Seq(
     Table("catalog_sales",
       partitionColumns = "cs_sold_date_sk" :: Nil,
       'cs_sold_date_sk          .int,

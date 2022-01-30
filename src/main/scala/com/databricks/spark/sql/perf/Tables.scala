@@ -16,18 +16,21 @@
 
 package com.databricks.spark.sql.perf
 
-import java.util.concurrent.LinkedBlockingQueue
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
 
+import java.util.concurrent.LinkedBlockingQueue
 import scala.collection.immutable.Stream
 import scala.sys.process._
-
 import org.slf4j.LoggerFactory
-
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{Row, SQLContext, SaveMode}
+import org.apache.spark.sql.{Row, SQLContext, SaveMode, SparkSession}
+
+import java.io.File
+import scala.io.Source
 
 
 /**
@@ -91,6 +94,13 @@ trait DataGenerator extends Serializable {
     name: String,
     partitions: Int,
     scaleFactor: String): RDD[String]
+
+  def generateAll(
+                sparkContext: SparkContext,
+                location: String,
+                partitions: Int,
+                scaleFactor: String): RDD[String] =
+    throw new UnsupportedClassVersionError("method of generateAll is not supported!")
 }
 
 
@@ -179,6 +189,7 @@ abstract class Tables(sqlContext: SQLContext, scaleFactor: String,
 
       val data = df(format != "text", numPartitions)
       val tempTableName = s"${name}_text"
+
       data.createOrReplaceTempView(tempTableName)
 
       val writer = if (partitionColumns.nonEmpty) {
@@ -251,6 +262,7 @@ abstract class Tables(sqlContext: SQLContext, scaleFactor: String,
       if (overwrite) {
         sqlContext.sql(s"DROP TABLE IF EXISTS $databaseName.$name")
       }
+
       if (!tableExists || overwrite) {
         println(s"Creating external table $name in database $databaseName using data stored in $location.")
         log.info(s"Creating external table $name in database $databaseName using data stored in $location.")
@@ -303,6 +315,40 @@ abstract class Tables(sqlContext: SQLContext, scaleFactor: String,
         throw new RuntimeException("Bad table name filter: " + tableFilter)
       }
     }
+
+    tablesToBeGenerated.foreach { table =>
+      val tableLocation = s"$location/${table.name}"
+      table.genData(tableLocation, format, overwrite, clusterByPartitionColumns,
+        filterOutNullPartitionValues, numPartitions)
+    }
+  }
+
+  def genRawData(
+               location: String,
+               format: String,
+               overwrite: Boolean,
+               partitionTables: Boolean,
+               clusterByPartitionColumns: Boolean,
+               filterOutNullPartitionValues: Boolean,
+               tableFilter: String = "",
+               numPartitions: Int = 100): Unit = {
+    // 预先生成数据到hdfs
+    var tablesToBeGenerated = if (partitionTables) {
+      tables
+    } else {
+      tables.map(_.nonPartitioned)
+    }
+
+    if (!tableFilter.isEmpty) {
+      tablesToBeGenerated = tablesToBeGenerated.filter(_.name == tableFilter)
+      if (tablesToBeGenerated.isEmpty) {
+        throw new RuntimeException("Bad table name filter: " + tableFilter)
+      }
+    }
+
+    // 先生成数据，得到hdfs路径
+    // todo location对吗？是resultPath吗？
+    dataGenerator.generateAll(sparkContext, location, numPartitions, scaleFactor)
 
     tablesToBeGenerated.foreach { table =>
       val tableLocation = s"$location/${table.name}"
